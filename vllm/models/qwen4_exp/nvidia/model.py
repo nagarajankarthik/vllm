@@ -32,10 +32,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -265,7 +267,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one decoder layer.
+
+        Returns ``(hidden_states, block_output, injection, block_input)``.  The
+        trailing ``block_input`` is this layer's attention-side mix: the gated
+        mean of the RMS-normalized multi-stream state, shape ``[T, H]``.  It is
+        the single-stream view the layer itself consumes, and EAGLE-3 style
+        drafters capture it as the layer's auxiliary hidden state.
+        """
         if prev_block_output is None:
             assert prev_injection is None
         attn_hc = self.attn_hyper_connection
@@ -295,6 +305,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
+        # Keep a reference before the MLP mix rebinds ``block_input``.
+        attn_block_input = block_input
+
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type in _QSA_LAYER_TYPES:
@@ -310,7 +323,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, attn_out, injection
         )
         mlp_out = self.mlp(block_input)
-        return hidden_states, mlp_out, injection
+        return hidden_states, mlp_out, injection, attn_block_input
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
@@ -363,7 +376,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -474,7 +487,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -499,6 +512,14 @@ class Qwen4ExpModel(nn.Module):
                 query_start_loc,
                 ngram_context,
             )
+        # EAGLE-3 capture ids are global layer positions with post-layer
+        # semantics.  Id ``i`` (1 <= i < num_layers) is layer ``i``'s own
+        # attention-side mix, and the reserved id ``num_layers`` is the
+        # post-final-mixer state the lm_head consumes, appended after the loop.
+        # Id 0 has no counterpart here: the embedding is replicated across hc
+        # streams and never mixed down to [T, H].
+        num_layers = len(self.layers)
+        aux_hidden_states: list[torch.Tensor] = []
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
@@ -511,7 +532,7 @@ class Qwen4ExpModel(nn.Module):
                     query_start_loc,
                     ngram_context,
                 )
-            hidden_states, block_output, injection = layer(
+            hidden_states, block_output, injection, attn_block_input = layer(
                 hidden_states=hidden_states,
                 prev_block_output=block_output,
                 prev_injection=injection,
@@ -520,6 +541,10 @@ class Qwen4ExpModel(nn.Module):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
             )
+            if layer_idx + 1 < num_layers:
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, layer_idx + 1, attn_block_input, None
+                )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
             ):
@@ -560,12 +585,19 @@ class Qwen4ExpModel(nn.Module):
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
+        # Reserved terminal slot: unlike a plain residual-stream model, the
+        # pre-lm_head state is produced by the final mixer rather than by the
+        # last layer, so it cannot be captured inside the loop.
+        if num_layers in self.aux_hidden_state_layers:
+            aux_hidden_states.append(sample_hidden_states)
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if self.aux_hidden_state_layers:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -618,6 +650,7 @@ class Qwen4ExpForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
 ):
@@ -684,7 +717,7 @@ class Qwen4ExpForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(

@@ -311,7 +311,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
-        hidden_states, block_output, injection = layer(
+        # The trailing element is the layer's attention-side mix, captured only
+        # by EAGLE-3 style drafters on the target model; MTP does not use it.
+        hidden_states, block_output, injection, _ = layer(
             hidden_states=hidden_states,
             prev_block_output=prev_block_output,
             prev_injection=None,
