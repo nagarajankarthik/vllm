@@ -167,6 +167,135 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
             Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize("method", ["dflash", "mtp", "ngram", "eagle3"])
+def test_qwen4_exp_speculative_methods(method):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(), multimodal_config=None
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=SimpleNamespace(method=method),
+    )
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        if method == "eagle3":
+            with pytest.raises(NotImplementedError, match="supports DFlash"):
+                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(config)
+        else:
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(config)
+
+
+class _CaptureMixer:
+    """Nonuniform learned read/write surrogate; kernel parity is in test_hc_ops."""
+
+    def __init__(self):
+        self.read_weight = torch.randn(8, 8)
+        self.inject_weight = torch.randn(8, 2)
+        self.calls = 0
+
+    def mix(self, hidden):
+        self.calls += 1
+        gates = (hidden @ self.read_weight).sigmoid().unflatten(-1, (2, 4))
+        feature = (hidden.unflatten(-1, (2, 4)) * gates).mean(-2)
+        return hidden, feature, hidden @ self.inject_weight
+
+    def combine(self, hidden, output, injection):
+        if output is None:
+            return hidden
+        return (
+            hidden.unflatten(-1, (2, 4))
+            + output.unsqueeze(-2) * (2 * (injection / 2).sigmoid()).unsqueeze(-1)
+        ).flatten(-2)
+
+    def combine_and_mix(self, hidden, output, injection):
+        return self.mix(self.combine(hidden, output, injection))
+
+
+@spawn_new_process_for_each_test
+@pytest.mark.parametrize("backend", ["amd", "nvidia"])
+def test_qwen4_exp_capture_uses_next_learned_readout_before_ple(backend):
+    """Capture is H-wide, ordered, and does not change actor/MTP outputs."""
+    module = import_module(f"vllm.models.qwen4_exp.{backend}.model")
+    torch.manual_seed(17)
+    model = object.__new__(module.Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hc_count=2, hidden_size=4)
+    model.start_layer, model.end_layer = 0, 3
+    model._mtp_hidden_buffer = torch.empty(5, 8)
+    model.hyper_connection_mixer = _CaptureMixer()
+    model._start_layer_ple_prefetch = lambda *args: None
+    layers = []
+    for i in range(3):
+        layer = object.__new__(module.Qwen4ExpDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.layer_type = "linear_attention"
+        layer.attn_hyper_connection = _CaptureMixer()
+        layer.mlp_hyper_connection = _CaptureMixer()
+        layer.linear_attn = lambda hidden_states: hidden_states * 0.3
+        layer.mlp = lambda hidden: hidden * -0.2
+        # AMD's PLE returns the delta; NVIDIA's PLE also applies the addition.
+        layer.ple = (
+            (
+                (lambda hidden, *args: hidden + 2)
+                if backend == "nvidia"
+                else (lambda hidden, *args: torch.full_like(hidden, 2))
+            )
+            if i == 1
+            else None
+        )
+        layers.append(layer)
+    model.layers = torch.nn.ModuleList(layers)
+    pp = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    embedded = torch.randn(5, 4)
+    inputs = dict(
+        input_ids=torch.arange(5),
+        positions=torch.arange(5),
+        inputs_embeds=embedded,
+        query_start_loc=torch.tensor([0, 5]),
+        ngram_context=torch.zeros(1, 2),
+    )
+    with patch.object(module, "get_pp_group", return_value=pp):
+        plain = model.forward(**inputs)
+        mtp = model._mtp_hidden_buffer.clone()
+        wrapper = object.__new__(module.Qwen4ExpForCausalLM)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.model = model
+        wrapper.set_aux_hidden_state_layers((0, 1, 2, 3))
+        captured_output, captured = model.forward(**inputs)
+
+    torch.testing.assert_close(captured_output, plain, rtol=0, atol=0)
+    torch.testing.assert_close(model._mtp_hidden_buffer, mtp, rtol=0, atol=0)
+    torch.testing.assert_close(captured[0], embedded)
+    assert all(value.shape == (5, 4) for value in captured)
+    assert [layer.attn_hyper_connection.calls for layer in layers] == [2, 3, 2]
+    # Independently step the real layers, reading each completed state with
+    # the *next* mixer before its PLE, rather than averaging the HC streams.
+    hidden = embedded.repeat(1, 2)
+    for index, layer in enumerate(layers):
+        hidden, output, injection = layer(
+            hidden,
+            None,
+            None,
+            inputs["positions"],
+            input_ids=inputs["input_ids"],
+            query_start_loc=inputs["query_start_loc"],
+            ngram_context=inputs["ngram_context"],
+        )
+        hidden = layer.mlp_hyper_connection.combine(hidden, output, injection)
+        mixer = (
+            layers[index + 1].attn_hyper_connection
+            if index < 2
+            else model.hyper_connection_mixer
+        )
+        expected = mixer.mix(hidden)[1]
+        torch.testing.assert_close(captured[index + 1], expected)
+        assert not torch.allclose(expected, hidden.unflatten(-1, (2, 4)).mean(-2))
+    assert captured[-1] is captured_output
+
+
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
     model_state = object.__new__(Qwen4ExpModelState)
     model_state.uses_ngram_embedding = True

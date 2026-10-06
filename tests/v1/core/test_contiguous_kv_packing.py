@@ -146,6 +146,7 @@ def _compressor_state_name(layer_index: int) -> str:
 def _make_csa_linear_specs(
     num_mamba: int = 7,
     num_tuples: int = NUM_CACHE_TUPLES,
+    ring_capacity: int = 4,
 ) -> dict[str, KVCacheSpec]:
     specs: dict[str, KVCacheSpec] = {}
     for layer_index in range(num_mamba):
@@ -176,7 +177,7 @@ def _make_csa_linear_specs(
             tokens_per_state=4,
         )
         specs[_compressor_state_name(layer_index)] = CircularBufferSpec(
-            block_size=4,
+            block_size=ring_capacity,
             num_kv_heads=1,
             head_size=8,
             head_size_v=0,
@@ -270,13 +271,16 @@ class TestCSALinearGrouping:
             assert tensor.block_stride == bytes_per_block
             assert tensor.offset < bytes_per_block
 
-    def test_scratch_group_survives_computed_block_truncation(self):
+    @pytest.mark.parametrize("ring_capacity", [4, 20])
+    def test_scratch_group_survives_computed_block_truncation(self, ring_capacity):
         """The scratch group contributes no computed blocks, so truncating a
         lookup result must skip it: its block size is the ring capacity, which
         neither divides the hit length nor bounds the (empty) block list."""
         config = _shared_layout_config()
         config.cache_config.enable_prefix_caching = True
-        groups = get_kv_cache_groups(config, _make_csa_linear_specs())
+        groups = get_kv_cache_groups(
+            config, _make_csa_linear_specs(ring_capacity=ring_capacity)
+        )
         kv_cache_config = get_kv_cache_config_from_groups(
             config, groups, available_memory=BYTES_PER_BLOCK * 64
         )
@@ -327,23 +331,60 @@ class TestCSALinearGrouping:
         with pytest.raises(ValueError, match="per-state compression"):
             resolve_kv_cache_block_sizes(kv_cache_config, config)
 
-    def test_scratch_ring_does_not_drag_hash_granularity(self):
+    @pytest.mark.parametrize("block_size", [16, 128, 848, 1616])
+    @pytest.mark.parametrize("enable_caching", [False, True])
+    def test_scratch_ring_does_not_drag_hash_granularity(
+        self, block_size, enable_caching
+    ):
         config = _shared_layout_config()
-        config.cache_config.enable_prefix_caching = True
+        config.cache_config.block_size = block_size
+        config.cache_config.enable_prefix_caching = enable_caching
         config.cache_config.mamba_cache_mode = "align"
+        config.kv_transfer_config = None
         specs = {
-            name: replace(spec, mamba_cache_mode="align")
+            name: replace(spec, block_size=block_size, mamba_cache_mode="align")
             if isinstance(spec, MambaSpec)
-            else spec
-            for name, spec in _make_csa_linear_specs(num_tuples=1).items()
+            else replace(
+                spec,
+                block_size=spec.block_size
+                if isinstance(spec, CircularBufferSpec)
+                else block_size,
+            )
+            for name, spec in _make_csa_linear_specs(
+                num_tuples=1, ring_capacity=20
+            ).items()
         }
         groups = get_kv_cache_groups(config, specs)
         kv_cache_config = get_kv_cache_config_from_groups(
-            config, groups, available_memory=8 * MAIN_KV_PAGE_BYTES
+            config, groups, available_memory=64 * _get_kv_cache_bytes_per_block(groups)
         )
-        # The hash granularity is the GCD over prefix-cacheable groups only;
-        # the 4-token scratch ring is excluded (it would drag it to 4).
-        assert resolve_kv_cache_block_sizes(kv_cache_config, config) == (16, 16)
+        views = _bind(kv_cache_config, "BLNHC")
+        ring_name = _compressor_state_name(0)
+        assert views[ring_name].numel() == 64 * 20 * specs[ring_name].head_size
+        # The 20-entry ring supports 15 draft tokens even though it divides
+        # neither the attention nor Mamba block. It must not enlarge their LCM.
+        assert resolve_kv_cache_block_sizes(kv_cache_config, config) == (
+            block_size,
+            block_size,
+        )
+        manager = KVCacheManager(
+            generate_scheduler_kv_cache_config([kv_cache_config]),
+            max_model_len=32768,
+            enable_caching=enable_caching,
+            hash_block_size=block_size,
+            scheduler_block_size=block_size,
+        )
+        for group, cache_manager in zip(
+            groups, manager.coordinator.single_type_managers
+        ):
+            if any(
+                isinstance(spec, CircularBufferSpec)
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            ):
+                assert cache_manager.block_size == 20
+                assert len(cache_manager.allocate_new_blocks("req", 128, 128)) == 1
+                assert cache_manager.allocate_new_blocks("req", 32768, 32768) == []
+                assert not cache_manager.records_new_block_ids
 
     def test_compressed_attention_hashes_can_be_finer_than_cache_hits(self):
         config = _shared_layout_config()

@@ -352,8 +352,11 @@ def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
     assert metadata.slot_mapping.tolist() == expected
 
 
-@pytest.mark.parametrize("chunk_start", list(range(8)))
-def test_qsa_circular_buffer_survives_one_speculative_step(chunk_start: int) -> None:
+@pytest.mark.parametrize("chunk_start", range(40))
+@pytest.mark.parametrize("num_spec", [0, 3, 15])
+def test_qsa_circular_buffer_survives_one_speculative_step(
+    chunk_start: int, num_spec: int
+) -> None:
     """A speculative step must not overwrite the open group's committed keys.
 
     The step stores every row it computes, drafts included, before acceptance
@@ -362,7 +365,6 @@ def test_qsa_circular_buffer_survives_one_speculative_step(chunk_start: int) -> 
     those rows alias, so a rejected draft silently replaces a committed key.
     """
     compress_ratio = 4
-    num_spec = 3
     capacity = compress_ratio * -(-(compress_ratio + num_spec) // compress_ratio)
     query_len = num_spec + 1
 
@@ -376,6 +378,16 @@ def test_qsa_circular_buffer_survives_one_speculative_step(chunk_start: int) -> 
 
     committed = torch.arange(chunk_start - chunk_start % compress_ratio, chunk_start)
     assert set(slots.tolist()).isdisjoint((committed % capacity).tolist())
+
+    ring = torch.full((capacity,), -1, dtype=torch.int64)
+    ring[committed % capacity] = committed
+    ring[slots] = torch.arange(chunk_start, chunk_start + query_len)
+    for accepted in range(num_spec + 1):
+        next_position = chunk_start + 1 + accepted
+        needed = torch.arange(
+            next_position - next_position % compress_ratio, next_position
+        )
+        torch.testing.assert_close(ring[needed % capacity], needed)
 
 
 def _qsa_key_cache(
@@ -437,16 +449,20 @@ def test_clearing_qsa_key_cache_releases_its_storage() -> None:
 
 @pytest.mark.parametrize(
     ("compress_ratio", "num_spec", "expected"),
-    [(4, 0, 4), (4, 1, 8), (4, 3, 8), (4, 4, 8), (4, 5, 12), (2, 3, 6)],
+    [(4, 0, 4), (4, 1, 8), (4, 3, 8), (4, 4, 8), (4, 5, 12), (4, 15, 20), (2, 3, 6)],
 )
+@pytest.mark.parametrize("block_size", [16, 48, 128, 848, 1616])
 def test_qsa_ring_capacity_covers_one_speculative_step(
-    compress_ratio: int, num_spec: int, expected: int
+    compress_ratio: int, num_spec: int, expected: int, block_size: int
 ) -> None:
     """Capacity spans the open group plus one speculative step, in whole groups."""
     spec = _qsa_key_cache(
-        block_size=48, compress_ratio=compress_ratio
+        block_size=block_size, compress_ratio=compress_ratio
     ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
     assert spec.block_size == expected
+    assert spec.scheduler_block_size == 1
+    assert spec.num_states == expected
+    assert spec.max_num_blocks_per_req(None, max_len=32768) == 1
 
 
 def test_qsa_kv_cache_dtype_honors_skip_layers() -> None:

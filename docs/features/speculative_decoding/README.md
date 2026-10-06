@@ -148,6 +148,25 @@ vllm serve <target-model> \
   }'
 ```
 
+#### DFlash with Qwen4Exp
+
+Use `method="dflash"` for DFlash and DFlash2 drafts trained on the target's
+learned HyperConnection features. For a draft trained with block size 16:
+
+```bash
+vllm serve /path/to/qwen4exp --dtype bfloat16 --pipeline-parallel-size 1 \
+  --speculative-config '{"method":"dflash","model":"/path/to/draft","num_speculative_tokens":15,"rejection_sample_method":"standard","enable_adaptive_verification":false}'
+```
+
+Each `target_layer_ids` entry names a completed zero-based decoder layer. Its
+feature is the next layer's learned attention readout before PLE injection;
+the final layer uses the learned final mixer. Features have backbone width,
+not concatenated or averaged residual streams. Native MTP's multi-stream
+input remains separate.
+
+Use `num_speculative_tokens=block_size-1` and PP=1. QSA, GDN and PLE require
+fixed-length verification; adaptive verification is unsupported for this target.
+
 #### Cross-Vocabulary Draft Models (TLI)
 
   By default, vLLM requires the draft and target models to share the same

@@ -84,10 +84,10 @@ class KVCacheCoordinator(ABC):
         num_prefill_lookahead: int = 0,
     ):
         self.kv_cache_config = kv_cache_config
-        # The scheduling granularity (LCM of all group block sizes), must be a multiple
-        # of the hash_block_size and the block size of each group.
+        # Scratch rings have storage capacity but impose no token alignment.
+        # Paged caches still require scheduler and hash boundaries to align.
         assert scheduler_block_size % hash_block_size == 0 and all(
-            scheduler_block_size % g.kv_cache_spec.block_size == 0
+            scheduler_block_size % g.kv_cache_spec.scheduler_block_size == 0
             for g in kv_cache_config.kv_cache_groups
         )
         self.scheduler_block_size = scheduler_block_size

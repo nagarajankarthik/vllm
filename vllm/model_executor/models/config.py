@@ -1011,12 +1011,13 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             _strip_qwen4_exp_mrope(vllm_config.model_config)
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method not in {
+            "dflash",
             "mtp",
             "ngram",
             "ngram_gpu",
         }:
             raise NotImplementedError(
-                "Qwen4Exp speculative decoding supports only its native MTP "
+                "Qwen4Exp speculative decoding supports DFlash, its native MTP "
                 "checkpoint and linear n-gram proposers"
             )
 

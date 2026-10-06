@@ -221,6 +221,11 @@ class KVCacheSpec:
     def block_table_token_alignment(self) -> int | None:
         return 128
 
+    @property
+    def scheduler_block_size(self) -> int:
+        """Token alignment required by this cache, independently of storage size."""
+        return self.block_size
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """The maximum possible memory usage of this KV cache in bytes.
 
@@ -909,6 +914,11 @@ class CircularBufferSpec(AttentionSpec):
     def block_table_token_alignment(self) -> int | None:
         return None
 
+    @property
+    def scheduler_block_size(self) -> int:
+        # One scratch block per request, not a page covering a token range.
+        return 1
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # The ring occupies one block per request for its whole lifetime.
         del vllm_config
@@ -1268,6 +1278,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def block_table_token_alignment(self) -> int | None:
         return self.first_spec.block_table_token_alignment
+
+    @property
+    def scheduler_block_size(self) -> int:
+        return self.first_spec.scheduler_block_size
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(

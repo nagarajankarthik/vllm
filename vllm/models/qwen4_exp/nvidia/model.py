@@ -32,10 +32,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -265,6 +267,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if prev_block_output is None:
             assert prev_injection is None
@@ -280,6 +283,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
+            if aux_hidden_states is not None:
+                # Capture the completed previous layer before PLE changes it.
+                aux_hidden_states.append(attn_hc.mix(hidden_states)[1])
             hidden_states = self.ple(
                 hidden_states,
                 input_ids,
@@ -294,6 +300,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+
+        if aux_hidden_states is not None and self.ple is None:
+            aux_hidden_states.append(block_input)
 
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
@@ -363,7 +372,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -474,7 +483,8 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        aux_hidden_states: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -482,6 +492,7 @@ class Qwen4ExpModel(nn.Module):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
+            self._maybe_add_hidden_state(aux_hidden_states, 0, hidden_states, None)
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
@@ -519,6 +530,11 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                aux_hidden_states=(
+                    aux_hidden_states
+                    if layer_idx > 0 and layer_idx in self.aux_hidden_state_layers
+                    else None
+                ),
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -566,6 +582,11 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        self._maybe_add_hidden_state(
+            aux_hidden_states, self.end_layer, sample_hidden_states, None
+        )
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -615,6 +636,7 @@ class Qwen4ExpModel(nn.Module):
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -690,7 +712,7 @@ class Qwen4ExpForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(
@@ -1020,7 +1042,7 @@ class Qwen4ExpForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if intermediate_tensors is not None:
             inputs_embeds = None
         if inputs_embeds is not None and get_pp_group().is_first_rank:
