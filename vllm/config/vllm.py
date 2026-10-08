@@ -779,7 +779,7 @@ class VllmConfig:
         return True
 
     def _is_dflash_candidate_draft(self) -> bool:
-        """Whether the DFlash draft has a candidate head, by the architecture the
+        """Whether DFlash has a candidate/refinement head, by the architecture the
         speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
         spec = self.speculative_config
         if spec is None or spec.method != "dflash":
@@ -788,9 +788,11 @@ class VllmConfig:
         if draft_config is None:
             return False
         return bool(
-            {"DFlash2DraftModel", "LiLiCorrDraftModel"}.intersection(
-                draft_config.architectures or []
-            )
+            {
+                "DFlash2DraftModel",
+                "LiLiCorrDraftModel",
+                "XPressDraftModel",
+            }.intersection(draft_config.architectures or [])
         )
 
     def _dflash_needs_multi_kv_group(self) -> bool:

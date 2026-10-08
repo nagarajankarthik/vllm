@@ -25,6 +25,12 @@ def init_speculator(
 
         return ExtractHiddenStatesSpeculator(vllm_config, device)
     elif speculative_config.method == "dflash":
+        if "XPressDraftModel" in speculative_config.draft_model_config.architectures:
+            from vllm.v1.worker.gpu.spec_decode.xpress.speculator import (
+                XPressSpeculator,
+            )
+
+            return XPressSpeculator(vllm_config, device)
         if "LiLiCorrDraftModel" in speculative_config.draft_model_config.architectures:
             from vllm.v1.worker.gpu.spec_decode.lilicorr.speculator import (
                 LiLiCorrSpeculator,
