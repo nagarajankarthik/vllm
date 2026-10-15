@@ -20,6 +20,7 @@ def _qsa_mqa_paged_uniform_kernel(
     q_ptr,
     k_cache_ptr,
     page_table_ptr,
+    query_start_loc_ptr,
     visible_blocks_ptr,
     logits_ptr,
     stride_q_row,
@@ -33,6 +34,7 @@ def _qsa_mqa_paged_uniform_kernel(
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     DECODE_QUERY_LEN: tl.constexpr,
+    VARLEN: tl.constexpr,
     BLOCK_N: tl.constexpr,
     TILES_PER_PROG: tl.constexpr,
     STAGES: tl.constexpr,
@@ -44,9 +46,17 @@ def _qsa_mqa_paged_uniform_kernel(
     BLOCK_D: tl.constexpr = max(16, triton.next_power_of_2(HEAD_DIM))
     request = tl.program_id(0)
     tile_start = tl.program_id(1) * TILES_PER_PROG
+    if VARLEN:
+        # DECODE_QUERY_LEN only bounds the request; its rows start at the device
+        # offset. Graph-padding requests are empty and return below.
+        row_start = tl.load(query_start_loc_ptr + request)
+        query_len = tl.load(query_start_loc_ptr + request + 1) - row_start
+    else:
+        row_start = request * DECODE_QUERY_LEN
+        query_len = DECODE_QUERY_LEN
     query_offsets = tl.arange(0, DECODE_QUERY_LEN_PADDED)
-    valid_query_offsets = query_offsets < DECODE_QUERY_LEN
-    rows = request * DECODE_QUERY_LEN + query_offsets
+    valid_query_offsets = query_offsets < query_len
+    rows = row_start + query_offsets
     visible = tl.load(
         visible_blocks_ptr + rows,
         mask=valid_query_offsets,
@@ -62,10 +72,10 @@ def _qsa_mqa_paged_uniform_kernel(
     n = tl.arange(0, DECODE_QUERY_LEN_PADDED * NUM_HEADS_PADDED)
     query_offset = n // NUM_HEADS_PADDED
     head = n % NUM_HEADS_PADDED
-    valid_query = (query_offset < DECODE_QUERY_LEN) & (head < NUM_HEADS)
+    valid_query = (query_offset < query_len) & (head < NUM_HEADS)
     query = tl.load(
         q_ptr
-        + (request * DECODE_QUERY_LEN + query_offset)[None, :] * stride_q_row
+        + (row_start + query_offset)[None, :] * stride_q_row
         + head[None, :] * stride_q_head
         + dims[:, None],
         mask=valid_query[None, :] & (dims[:, None] < HEAD_DIM),
@@ -292,10 +302,14 @@ def _qsa_decode_warmup_profiles(
     max_num_reqs: int,
     max_num_batched_tokens: int,
     columns: int,
+    varlen: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     profiles: list[tuple[int, int]] = []
-    for dql in range(1, max_dql + 1):
-        max_reqs = min(max_num_reqs, max_num_batched_tokens // dql)
+    # Varlen launches always specialize on the bound, and a request may hold a
+    # single token, so only the batch size limits the request count.
+    dqls = (max_dql,) if varlen else range(1, max_dql + 1)
+    for dql in dqls:
+        max_reqs = min(max_num_reqs, max_num_batched_tokens // (1 if varlen else dql))
         requests_by_grouping: dict[int, int] = {}
         for num_requests in range(1, max_reqs + 1):
             tiles_per_program = _decode_tiles_per_program(num_requests, columns)
@@ -315,6 +329,7 @@ def warmup_qsa_mqa_paged_decode(
     max_decode_query_len: int,
     max_num_reqs: int,
     max_num_batched_tokens: int,
+    varlen: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Compile every reachable decode specialization without launching it."""
     page_size = k_cache.shape[1]
@@ -325,6 +340,7 @@ def warmup_qsa_mqa_paged_decode(
         max_num_reqs,
         max_num_batched_tokens,
         columns,
+        varlen=varlen,
     )
     if not profiles:
         return ()
@@ -335,6 +351,7 @@ def warmup_qsa_mqa_paged_decode(
         shape=(max_num_reqs, page_table_width),
     )
     visible_blocks_ptr = TritonWarmupTensor(torch.int32)
+    query_start_loc_ptr = TritonWarmupTensor(torch.int32)
 
     for decode_query_len, num_requests in profiles:
         num_rows = decode_query_len * num_requests
@@ -351,6 +368,7 @@ def warmup_qsa_mqa_paged_decode(
             q_ptr,
             k_cache_ptr,
             page_table_ptr,
+            query_start_loc_ptr,
             visible_blocks_ptr,
             logits_ptr,
             num_heads * head_dim,
@@ -364,6 +382,7 @@ def warmup_qsa_mqa_paged_decode(
             NUM_HEADS=num_heads,
             HEAD_DIM=head_dim,
             DECODE_QUERY_LEN=decode_query_len,
+            VARLEN=varlen,
             BLOCK_N=_DECODE_BLOCK_N,
             TILES_PER_PROG=tiles_per_program,
             STAGES=2,
@@ -513,28 +532,39 @@ def qsa_select_paged_decode(
     compress_ratio: int,
     decode_query_len: int,
     block_indices: torch.Tensor,
+    query_start_loc: torch.Tensor | None = None,
 ) -> None:
     """Score and select compressed blocks for a request-major decode batch.
 
     Args:
-        q: Query tensor shaped ``[num_requests * decode_query_len, heads,
-            head_dim]``.
+        q: Query tensor shaped ``[num_decode_tokens, heads, head_dim]``.
         k_cache: Compressed key cache shaped ``[blocks, page_size, 1,
             head_dim]``.
         page_table: Request block table shaped ``[num_requests, max_pages]``.
         visible_blocks: Number of visible compressed blocks per query.
         token_topk: Number of logical tokens selected per query.
         compress_ratio: Number of logical tokens represented by a cache row.
-        decode_query_len: Number of query tokens per request.
+        decode_query_len: Number of query tokens per request, or their upper
+            bound when ``query_start_loc`` is given.
         block_indices: Compressed-index output buffer.
+        query_start_loc: Device row offsets of the requests, shaped
+            ``[num_requests + 1]``. Given when request lengths vary and are
+            known only on device (adaptive verification).
 
     """
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
-    assert decode_query_len > 0 and q.shape[0] % decode_query_len == 0
     assert q.dtype == k_cache.dtype, "Q and the compressed K cache must match"
-    num_requests = q.shape[0] // decode_query_len
-    assert page_table.shape[0] == num_requests
+    num_requests = page_table.shape[0]
+    varlen = query_start_loc is not None
+    assert decode_query_len > 0
+    if query_start_loc is None:
+        assert q.shape[0] == num_requests * decode_query_len
+    else:
+        # Only the bound is checkable on the host; the split is on device.
+        assert query_start_loc.shape == (num_requests + 1,)
+        assert query_start_loc.dtype == torch.int32
+        assert q.shape[0] <= num_requests * decode_query_len
     assert visible_blocks.shape == (q.shape[0],)
 
     columns = page_table.shape[1] * k_cache.shape[1]
@@ -548,6 +578,8 @@ def qsa_select_paged_decode(
         q,
         k_cache,
         page_table,
+        # Unread unless VARLEN; any int32 tensor stands in.
+        query_start_loc if varlen else visible_blocks,
         visible_blocks,
         logits,
         *q.stride()[:-1],
@@ -559,6 +591,7 @@ def qsa_select_paged_decode(
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         DECODE_QUERY_LEN=decode_query_len,
+        VARLEN=varlen,
         BLOCK_N=_DECODE_BLOCK_N,
         TILES_PER_PROG=tiles_per_program,
         STAGES=2,

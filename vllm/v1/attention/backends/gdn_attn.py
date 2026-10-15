@@ -91,6 +91,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+    # Whether a spec-decode batch whose rows all carry zero drafts stays on the
+    # spec-decode kernels instead of collapsing to plain decode. Varlen decode
+    # graphs capture a single kernel path that every decode batch replays.
+    keep_draftless_spec_decodes: bool = False
 
     def __init__(
         self,
@@ -260,9 +264,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-            if (
-                num_spec_decodes == 0
-                or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+            if num_spec_decodes == 0 or (
+                not self.keep_draftless_spec_decodes
+                and num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
                 == 0
             ):
                 num_spec_decodes = 0

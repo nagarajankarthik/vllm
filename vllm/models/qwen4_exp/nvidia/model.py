@@ -76,6 +76,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .linear_attn_backends import Qwen4ExpGDNAttentionBackend
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_layer import Qwen4ExpPLELayer
@@ -160,6 +161,13 @@ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
+class Qwen4ExpGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    """Qwen GDN on the backend that admits adaptive verification."""
+
+    def get_attn_backend(self) -> type[Qwen4ExpGDNAttentionBackend]:
+        return Qwen4ExpGDNAttentionBackend
+
+
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
 
@@ -209,7 +217,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         if layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
+            self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",

@@ -215,6 +215,7 @@ class QSAIndexer(nn.Module):
             raw.num_prefills,
             raw.num_prefill_tokens,
             raw.decode_query_len,
+            raw.varlen_decode,
         )
         compressed_split = (
             compressed.num_decodes,
@@ -222,6 +223,7 @@ class QSAIndexer(nn.Module):
             compressed.num_prefills,
             compressed.num_prefill_tokens,
             compressed.decode_query_len,
+            compressed.varlen_decode,
         )
         if raw_split != compressed_split:
             raise RuntimeError("QSA side-cache metadata batch splits disagree")
@@ -431,10 +433,19 @@ class QSAIndexer(nn.Module):
             device=q.device,
         )
 
-        # Decode requests occupy the leading rows and share one query length.
+        # Decode requests occupy the leading rows. They share one query length,
+        # unless varlen_decode, where decode_query_len only bounds the lengths
+        # and the device offsets hold the true ones.
         if num_decode_tokens:
             num_decodes = compressed_metadata.num_decodes
-            if num_decodes * decode_query_len != num_decode_tokens:
+            decode_query_start_loc = None
+            if compressed_metadata.varlen_decode:
+                if num_decode_tokens > num_decodes * decode_query_len:
+                    raise ValueError("QSA decode rows exceed the decode length bound")
+                decode_query_start_loc = compressed_metadata.query_start_loc[
+                    : num_decodes + 1
+                ]
+            elif num_decodes * decode_query_len != num_decode_tokens:
                 raise ValueError("QSA decode rows must form a uniform request batch")
             decode_slice = slice(0, num_decode_tokens)
             qsa_select_paged_decode(
@@ -446,6 +457,7 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 decode_query_len,
                 block_indices[decode_slice],
+                query_start_loc=decode_query_start_loc,
             )
 
         # Prefill requests follow the leading decode rows in the reordered batch.

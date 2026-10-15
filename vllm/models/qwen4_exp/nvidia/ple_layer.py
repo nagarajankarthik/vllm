@@ -20,10 +20,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
-    PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
 
+from .linear_attn_backends import Qwen4ExpPleShortConvAttentionBackend
 from .ngram_embedding import Qwen4ExpNGramEmbedding
 from .ops.ple import ple_conv, ple_gate
 
@@ -172,8 +172,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     def is_kv_cache_tp_replicated(self) -> bool:
         return True
 
-    def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
-        return PleShortConvAttentionBackend
+    def get_attn_backend(self) -> type[Qwen4ExpPleShortConvAttentionBackend]:
+        return Qwen4ExpPleShortConvAttentionBackend
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return MambaStateDtypeCalculator.short_conv_state_dtype(

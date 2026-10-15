@@ -551,7 +551,10 @@ class SpeculativeConfig:
 
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
-    confidence. Currently only supported for method="dspark"."""
+    confidence. Requires Model Runner V2 and full CUDA graphs, and every target
+    attention backend must accept device-decided query lengths. DSpark drafts
+    with a confidence head; other drafters estimate acceptance from the draft
+    logits."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:

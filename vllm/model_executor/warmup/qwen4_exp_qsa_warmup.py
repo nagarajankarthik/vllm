@@ -57,6 +57,11 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         warmup_qsa_mqa_paged_decode,
     )
 
+    # Adaptive verification trims decode rows on device; the indexer then runs
+    # the varlen decode specialization (see QSAForwardMetadata.varlen_decode).
+    spec_config = worker.vllm_config.speculative_config
+    varlen = spec_config is not None and spec_config.enable_adaptive_verification
+
     k_cache = indexer.compressed_key_cache.kv_cache
     assert k_cache.numel()
     profiles = warmup_qsa_mqa_paged_decode(
@@ -67,6 +72,7 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         max_decode_query_len=max_decode_query_len,
         max_num_reqs=runner.max_num_reqs,
         max_num_batched_tokens=runner.max_num_tokens,
+        varlen=varlen,
     )
     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
 

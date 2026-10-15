@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import (
     PAD_SLOT_ID,
@@ -590,16 +591,32 @@ class QSAForwardMetadata(AttentionMetadata):
     num_prefills: int
     num_prefill_tokens: int
     max_query_len: int
+    # Exact per-request decode length, or its upper bound when varlen_decode.
     decode_query_len: int
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    # Decode requests may be shorter than decode_query_len; their true lengths
+    # live only in the device query_start_loc (adaptive verification).
+    varlen_decode: bool = False
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Set from the config in __init__; see QSAForwardMetadata.varlen_decode.
+    varlen_decode: bool = False
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls: type["QSAMetadataBuilder"],
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> int | None:
+        # Under adaptive verification the decode rows read their lengths from the
+        # device offsets, so a graph replays any length up to the reorder bound.
+        return max_decode_query_len(vllm_config)
 
     def __init__(
         self,
@@ -611,6 +628,12 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         assert self.reorder_batch_threshold is not None
+        spec_config = vllm_config.speculative_config
+        # Adaptive verification trims drafts on device, so the CPU query lengths
+        # of decode requests are only an even split of the true ones.
+        self.varlen_decode = (
+            spec_config is not None and spec_config.enable_adaptive_verification
+        )
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = kv_cache_spec.tokens_per_state
@@ -662,13 +685,18 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=decode_threshold,
-                require_uniform=True,
+                require_uniform=not self.varlen_decode,
             )
         )
         assert num_decodes + num_prefills == common_attn_metadata.num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
         decode_query_len = 0
-        if num_decodes > 0:
+        if self.varlen_decode:
+            # The CPU split keeps the decode token total exact; the decode
+            # kernel reads each request's length from the device offsets.
+            if num_decodes > 0:
+                decode_query_len = decode_threshold
+        elif num_decodes > 0:
             query_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -721,6 +749,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            varlen_decode=self.varlen_decode,
         )
 
 
@@ -749,6 +778,13 @@ class QSAStateBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type[QSAMetadataBuilder]:
         return QSAMetadataBuilder
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Per-token metadata is built from the device query_start_loc, and with
+        # adaptive verification the decode selection reads each request's length
+        # from it too (QSAForwardMetadata.varlen_decode).
+        return True
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:

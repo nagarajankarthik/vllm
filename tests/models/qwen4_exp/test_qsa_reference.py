@@ -807,6 +807,220 @@ def test_qsa_decode_selection_correctness(
 
 
 @requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("query_lens", "max_query_len"),
+    [
+        # Adaptive verification trims each request on device independently.
+        ([3, 1, 4, 2], 4),
+        # Every request trimmed to its bonus token.
+        ([1, 1, 1, 1, 1], 5),
+        # The bound pads past the longest request (5 -> 8 query slots).
+        ([2, 5, 1], 5),
+        # Trailing cudagraph padding requests carry no rows.
+        ([4, 2, 0, 0], 4),
+        ([(i * 7) % 4 + 1 for i in range(33)], 4),
+    ],
+)
+def test_qsa_varlen_decode_selection_correctness(
+    query_lens: list[int], max_query_len: int
+) -> None:
+    torch.manual_seed(1)
+    heads, head_dim = 4, 128
+    num_requests = len(query_lens)
+    rows = sum(query_lens)
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    # Past 512 visible blocks the top-k depends on the scores, so a row read from
+    # the wrong offset changes the selection instead of hiding behind it.
+    page_size, pages_per_request, max_sequence_length = 16, 40, 2560
+    num_pages = num_requests * pages_per_request
+    cache = torch.randn(
+        num_pages, page_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        num_requests, pages_per_request
+    )
+    lengths = torch.tensor(query_lens, device="cuda", dtype=torch.int32)
+    query_start_loc = torch.zeros(num_requests + 1, device="cuda", dtype=torch.int32)
+    torch.cumsum(lengths, dim=0, out=query_start_loc[1:])
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_requests, device="cuda", dtype=torch.int32), lengths
+    )
+    sequence_lengths = max_sequence_length - 4 * (
+        torch.arange(num_requests, device="cuda", dtype=torch.int32) % 8
+    )
+    query_positions = torch.cat(
+        [
+            torch.arange(length - query_len, length, device="cuda", dtype=torch.int32)
+            for length, query_len in zip(sequence_lengths.tolist(), query_lens)
+        ]
+    )
+    visible_blocks = torch.minimum(
+        (query_positions + 1) // 4,
+        sequence_lengths.index_select(0, token_to_req.long()) // 4,
+    )
+
+    token_topk, compress_ratio = 2048, 4
+    actual = torch.empty(
+        (rows, token_topk // compress_ratio), device="cuda", dtype=torch.int32
+    )
+    qsa_indexer_ops.qsa_select_paged_decode(
+        q,
+        cache,
+        page_table,
+        visible_blocks,
+        token_topk,
+        compress_ratio,
+        max_query_len,
+        actual,
+        query_start_loc=query_start_loc,
+    )
+    expected = _qsa_select_paged_reference(
+        q,
+        cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+    )
+
+    torch.testing.assert_close(actual.sort().values, expected.sort().values)
+
+
+@requires_qsa_kernels
+def test_qsa_varlen_decode_matches_uniform_decode() -> None:
+    """Uniform batches give the same selection on either decode path."""
+    torch.manual_seed(2)
+    num_requests, query_len, heads, head_dim = 6, 3, 4, 128
+    pages_per_request, page_size = 40, 16
+    rows = num_requests * query_len
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(
+        num_requests * pages_per_request,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.randperm(
+        num_requests * pages_per_request, device="cuda", dtype=torch.int32
+    ).reshape(num_requests, pages_per_request)
+    # More visible blocks than the 512 selected, so scores decide the selection.
+    num_columns = pages_per_request * page_size
+    visible_blocks = torch.randint(
+        513, num_columns + 1, (rows,), device="cuda", dtype=torch.int32
+    )
+    query_start_loc = torch.arange(
+        0, rows + 1, query_len, device="cuda", dtype=torch.int32
+    )
+
+    uniform = torch.empty((rows, 512), device="cuda", dtype=torch.int32)
+    varlen = torch.empty_like(uniform)
+    args = (q, cache, page_table, visible_blocks, 2048, 4)
+    qsa_indexer_ops.qsa_select_paged_decode(*args, query_len, uniform)
+    # The varlen launch is compiled for a wider bound than any request.
+    qsa_indexer_ops.qsa_select_paged_decode(
+        *args, query_len + 2, varlen, query_start_loc=query_start_loc
+    )
+
+    torch.testing.assert_close(varlen.sort().values, uniform.sort().values)
+
+
+def test_qsa_varlen_decode_warmup_profiles_use_only_the_bound() -> None:
+    uniform = qsa_indexer_ops._qsa_decode_warmup_profiles(4, 8, 16, 1024)
+    varlen = qsa_indexer_ops._qsa_decode_warmup_profiles(4, 8, 16, 1024, varlen=True)
+
+    assert {dql for dql, _ in uniform} == {1, 2, 3, 4}
+    assert {dql for dql, _ in varlen} == {4}
+    # A varlen request may hold one token, so the batch size alone caps it.
+    assert max(num_requests for _, num_requests in varlen) <= 8
+
+
+def _qsa_split_builder(device: torch.device, varlen_decode: bool, num_tokens: int):
+    builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.compress_ratio = 1
+    builder.reorder_batch_threshold = 4
+    builder.varlen_decode = varlen_decode
+    builder.is_circular_buffer = False
+    builder.storage_block_size = 64
+    builder.token_to_req_buffer = torch.empty(
+        num_tokens, dtype=torch.int32, device=device
+    )
+    builder.slot_mapping_buffer = torch.empty(
+        num_tokens, dtype=torch.int64, device=device
+    )
+    builder.logical_positions_buffer = torch.empty(
+        num_tokens, dtype=torch.int64, device=device
+    )
+    builder.visible_blocks_buffer = torch.empty(
+        num_tokens, dtype=torch.int32, device=device
+    )
+    builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32, device=device)
+    return builder
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("varlen_decode", [False, True])
+def test_qsa_builder_splits_device_trimmed_decodes(varlen_decode: bool) -> None:
+    device = torch.device("cuda")
+    # The device trimmed the four verification requests to [3, 1, 4, 2]; the
+    # CPU only holds the even split of that budget. A prefill chunk follows.
+    device_query_lens = [3, 1, 4, 2, 9]
+    cpu_query_lens = [3, 3, 2, 2, 9]
+    num_tokens = sum(device_query_lens)
+    assert sum(cpu_query_lens) == num_tokens
+    builder = _qsa_split_builder(device, varlen_decode, num_tokens)
+
+    def offsets(lengths: list[int], on: torch.device) -> torch.Tensor:
+        return torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=on,
+        )
+
+    seq_lens = [100, 90, 80, 70, 9]
+    common = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        num_reqs=5,
+        max_query_len=9,
+        max_seq_len=100,
+        query_start_loc=offsets(device_query_lens, device),
+        query_start_loc_cpu=offsets(cpu_query_lens, torch.device("cpu")),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+        slot_mapping=torch.arange(num_tokens, dtype=torch.int64, device=device),
+        block_table_tensor=torch.zeros((5, 2), dtype=torch.int32, device=device),
+    )
+
+    metadata = builder.build(0, common)
+
+    assert metadata.varlen_decode is varlen_decode
+    if varlen_decode:
+        # Every verification request stays a decode; the decode token total
+        # and the prefill offsets agree between the CPU and the device.
+        assert metadata.num_decodes == 4
+        assert metadata.num_decode_tokens == 10
+        assert metadata.decode_query_len == 4
+    else:
+        # Without varlen_decode the uneven CPU split demotes requests to prefill.
+        assert metadata.num_decodes == 2
+        assert metadata.num_decode_tokens == 6
+        assert metadata.decode_query_len == 3
+    # Per-token metadata follows the device offsets either way.
+    expected_token_to_req = [
+        req for req, length in enumerate(device_query_lens) for _ in range(length)
+    ]
+    assert metadata.token_to_req.tolist() == expected_token_to_req
+    expected_positions = [
+        seq_len - length + j
+        for seq_len, length in zip(seq_lens, device_query_lens)
+        for j in range(length)
+    ]
+    assert metadata.logical_positions.tolist() == expected_positions
+
+
+@requires_qsa_kernels
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("seq_len_slack", [0, 1792])
 @pytest.mark.parametrize("force_chunk", [False, True])
