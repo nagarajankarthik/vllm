@@ -24,8 +24,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
 )
 
-from .linear_attn_backends import Qwen4ExpPleShortConvAttentionBackend
 from ..common.ops.ple import ple_conv, ple_gate
+from .linear_attn_backends import Qwen4ExpPleShortConvAttentionBackend
 from .ngram_embedding import Qwen4ExpNGramEmbedding
 
 

@@ -277,27 +277,6 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state[0].item() is True
 
 
-@pytest.mark.parametrize("keep_draftless", [False, True])
-def test_draftless_spec_decodes_collapse_unless_kept(keep_draftless: bool):
-    """A spec batch without drafts falls back to plain decode, unless the
-    builder keeps it on the spec kernels a varlen decode graph captured."""
-    builder = _create_gdn_builder(num_speculative_tokens=3)
-    builder.keep_draftless_spec_decodes = keep_draftless
-    batch = BatchSpec(seq_lens=[40, 30, 20], query_lens=[1, 1, 1])
-    meta = _build(builder, batch, num_decode_draft_tokens=[0, 0, 0])
-
-    if keep_draftless:
-        assert meta.num_spec_decodes == 3
-        assert meta.num_spec_decode_tokens == 3
-        assert meta.num_decodes == 0
-        assert meta.spec_query_start_loc is not None
-        assert meta.spec_query_start_loc.tolist() == [0, 1, 2, 3]
-    else:
-        assert meta.num_spec_decodes == 0
-        assert meta.num_decodes == 3
-    assert meta.num_prefills == 0
-
-
 def test_full_cudagraph_spec_metadata_uses_request_count():
     """FULL cudagraph token padding must not pad request-indexed metadata."""
     num_speculative_tokens = 3

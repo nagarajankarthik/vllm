@@ -343,7 +343,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
-
         if self.use_hc_sequence_parallel:
             # Positions retain the full token axis for both text and MRoPE inputs.
             block_input = sp_all_gather(block_input)[: positions.shape[-1]]
