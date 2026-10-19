@@ -1024,6 +1024,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             "mtp",
             "ngram",
             "ngram_gpu",
+            "extract_hidden_states",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports DFlash, its native MTP "
