@@ -1,12 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from vllm.model_executor.models.qwen3_xpress import XPressRefinerHead
+from vllm.model_executor.models.qwen3_xpress import (
+    XPressRefinerHead,
+    xpress_head_geometry,
+    xpress_num_jacobi_passes,
+)
 
 V, H, B, R = 61, 32, 8, 16
+
+
+# A raw AutoModel export records the refiner only under dflash_config. Values differ
+# from the runtime defaults so a fallback to them cannot pass.
+def test_geometry_from_automodel_dflash_config():
+    config = SimpleNamespace(
+        block_size=8,
+        dflash_config=dict(
+            block_size=8,
+            xpress_rank=128,
+            xpress_mlp_ratio=3,
+            xpress_num_jacobi_passes=4,
+        ),
+    )
+    assert xpress_head_geometry(config, num_speculative_tokens=7) == (8, 128, 384)
+    assert xpress_num_jacobi_passes(config) == 4
+
+
+# UIUC checkpoints and AutoModel's serving adapter write top-level keys, which win.
+def test_top_level_keys_take_precedence():
+    config = SimpleNamespace(
+        xpress_block_size=8,
+        xpress_rank=64,
+        xpress_mlp_hidden=100,
+        xpress_num_passes=3,
+        dflash_config=dict(block_size=16, xpress_rank=256, xpress_num_jacobi_passes=6),
+    )
+    assert xpress_head_geometry(config, num_speculative_tokens=7) == (8, 64, 100)
+    assert xpress_num_jacobi_passes(config) == 3
+
+
+def test_geometry_defaults_without_any_keys():
+    config = SimpleNamespace()
+    assert xpress_head_geometry(config, num_speculative_tokens=15) == (16, 256, 512)
+    assert xpress_num_jacobi_passes(config) == 6
+
+
+def test_block_size_must_match_speculative_tokens():
+    config = SimpleNamespace(dflash_config=dict(block_size=16))
+    with pytest.raises(ValueError, match="num_speculative_tokens=15"):
+        xpress_head_geometry(config, num_speculative_tokens=7)
 
 
 # Serving stores L*tril + I and drops the residual; training stores raw L and adds it.

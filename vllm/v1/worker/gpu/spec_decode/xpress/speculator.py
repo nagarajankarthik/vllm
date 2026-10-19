@@ -7,6 +7,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.qwen3_xpress import xpress_num_jacobi_passes
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -36,7 +37,7 @@ class XPressSpeculator(DFlashSpeculator):
         self.sample_from_anchor = False
         self.num_query_per_req = 1 + self.num_speculative_steps
 
-        self.num_jacobi_passes = int(getattr(hf, "xpress_num_passes", 6))
+        self.num_jacobi_passes = xpress_num_jacobi_passes(hf)
         topc = getattr(hf, "xpress_topc", 512)
         logger.info(
             "XPress: %d Jacobi passes, top-C=%s",

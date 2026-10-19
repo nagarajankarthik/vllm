@@ -14,9 +14,55 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.v1.worker.gpu.spec_decode.xpress import kernels
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
+from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
 from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
 logger = init_logger(__name__)
+
+
+def xpress_config_value(config, key: str, dflash_key: str | None = None):
+    """Read an XPress setting from the draft config.
+
+    The top-level ``key`` is this runtime's spelling, which UIUC checkpoints and
+    AutoModel's serving adapter write. A raw AutoModel export records the same
+    setting only under ``dflash_config[dflash_key]``.
+    """
+    value = getattr(config, key, None)
+    if value is None and dflash_key is not None:
+        value = (getattr(config, "dflash_config", None) or {}).get(dflash_key)
+    return value
+
+
+def xpress_head_geometry(config, num_speculative_tokens: int) -> tuple[int, int, int]:
+    """Return the refiner's (block_size, rank, mlp_hidden) for this draft config."""
+    block_size = (
+        xpress_config_value(config, "xpress_block_size", "block_size")
+        or getattr(config, "block_size", None)
+        or 1 + num_speculative_tokens
+    )
+    block_size = int(block_size)
+    if block_size != 1 + num_speculative_tokens:
+        # The folded mixer and the fused kernels are sized by the trained block,
+        # so a different query width would mix the wrong slots.
+        raise ValueError(
+            f"XPress was trained with block_size={block_size}, so it must be "
+            f"served with num_speculative_tokens={block_size - 1}, got "
+            f"{num_speculative_tokens}."
+        )
+    rank = int(xpress_config_value(config, "xpress_rank", "xpress_rank") or 256)
+    mlp_hidden = xpress_config_value(config, "xpress_mlp_hidden")
+    if mlp_hidden is None:
+        mlp_ratio = xpress_config_value(config, "xpress_mlp_ratio", "xpress_mlp_ratio")
+        mlp_hidden = rank * int(mlp_ratio) if mlp_ratio is not None else 512
+    return block_size, rank, int(mlp_hidden)
+
+
+def xpress_num_jacobi_passes(config) -> int:
+    """Serving Jacobi pass count; AutoModel records it as xpress_num_jacobi_passes."""
+    passes = xpress_config_value(
+        config, "xpress_num_passes", "xpress_num_jacobi_passes"
+    )
+    return int(passes if passes is not None else 6)
 
 
 class XPressRefinerHead(nn.Module):
@@ -256,6 +302,28 @@ class Qwen3XPressModel(DFlashQwen3Model):
         start_layer_id: int = 0,
         prefix: str = "",
     ) -> None:
+        spec = vllm_config.speculative_config
+        assert spec is not None
+        draft_config = getattr(spec.draft_model_config.hf_config, "dflash_config", None)
+        draft_config = draft_config or {}
+        # Drafts warm-started from DFlash2 keep its per-layer convolutions.
+        taps = int(draft_config.get("conv_kernel_size") or 0)
+        groups = int(draft_config.get("conv_group_size") or 0)
+        if taps < 0 or groups < 0 or bool(taps) != bool(groups):
+            raise ValueError(
+                "XPress convolution geometry must enable both taps and group size."
+            )
+        if taps:
+            self.decoder_layer_cls = DFlash2Qwen3DecoderLayer
+        # AutoModel applies these to the draft's embeddings and logits; this
+        # runtime does not, so a draft that sets them would be served wrongly.
+        for key in ("input_embedding_scale", "output_multiplier"):
+            if float(draft_config.get(key, 1.0)) != 1.0:
+                raise NotImplementedError(f"XPress does not support {key} != 1.")
+        if float(draft_config.get("final_logit_softcapping") or 0.0) > 0.0:
+            raise NotImplementedError(
+                "XPress does not support final_logit_softcapping."
+            )
         super().__init__(
             vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
         )
@@ -263,13 +331,15 @@ class Qwen3XPressModel(DFlashQwen3Model):
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
+        block_size, rank, mlp_hidden = xpress_head_geometry(
+            config, spec.num_speculative_tokens
+        )
         self.xpress_head = XPressRefinerHead(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
-            block_size=getattr(config, "xpress_block_size", None)
-            or (getattr(config, "num_speculative_steps", 15) + 1),
-            rank=getattr(config, "xpress_rank", 256),
-            mlp_hidden=getattr(config, "xpress_mlp_hidden", 512),
+            block_size=block_size,
+            rank=rank,
+            mlp_hidden=mlp_hidden,
             max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
             topc=getattr(config, "xpress_topc", 512),
         )
