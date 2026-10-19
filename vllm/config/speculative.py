@@ -1503,6 +1503,12 @@ class SpeculativeConfig:
                     raise ValueError("xpress_topc is only supported by XPress")
 
                 if self.is_xpress():
+                    if self.draft_sample_method != "greedy":
+                        raise ValueError(
+                            "XPress drafts greedily (each Jacobi pass takes an "
+                            "argmax), so it has no draft distribution to sample "
+                            "from. Set draft_sample_method='greedy' (the default)."
+                        )
                     hf_config = self.draft_model_config.hf_config
                     xpress_topc = self.xpress_topc
                     if xpress_topc is None:

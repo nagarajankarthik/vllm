@@ -3588,6 +3588,62 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+@pytest.mark.parametrize("draft_sample_method", ["greedy", "probabilistic"])
+def test_xpress_requires_greedy_drafting(tmp_path: Path, draft_sample_method: str):
+    """XPress never fills the cached draft logits, so probabilistic rejection
+    would grade its drafts against an empty proposal distribution."""
+    from transformers import LlamaConfig
+
+    common = dict(
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        max_position_embeddings=2048,
+    )
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    _write_json(
+        target_path / "config.json",
+        LlamaConfig(architectures=["LlamaForCausalLM"], **common).to_dict(),
+    )
+    _write_json(
+        draft_path / "config.json",
+        dict(
+            common,
+            architectures=["Qwen3XPressModel"],
+            model_type="qwen3",
+            num_hidden_layers=1,
+            dflash_config=dict(
+                block_size=4,
+                mask_token_id=255,
+                target_layer_ids=[0],
+            ),
+        ),
+    )
+    model_config = ModelConfig(
+        model=str(target_path), tokenizer_mode="skip", max_model_len=2048
+    )
+
+    def make() -> SpeculativeConfig:
+        return SpeculativeConfig(
+            method="dflash",
+            model=str(draft_path),
+            num_speculative_tokens=3,
+            draft_sample_method=draft_sample_method,
+            target_model_config=model_config,
+            target_parallel_config=ParallelConfig(),
+        )
+
+    if draft_sample_method == "greedy":
+        assert make().is_xpress()
+    else:
+        with pytest.raises(ValueError, match="XPress drafts greedily"):
+            make()
+
+
 def _watermarked_vllm_config() -> VllmConfig:
     config = object.__new__(VllmConfig)
     config.watermark_config = WatermarkConfig(key=42)
