@@ -64,10 +64,49 @@ def test_jacobi_is_deterministic():
     anchor = torch.randint(0, V, (2,), device="cuda")
     tok_am1 = torch.randint(0, V, (2,), device="cuda")
 
-    first = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
-    second = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
+    first, _ = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
+    second, _ = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
     assert first.shape == (2, B - 1)
     assert torch.equal(first, second)
+
+
+# Adaptive verification scores the logits the last pass took its argmax over. With
+# top-C covering the whole vocabulary, those are base + refine_bias of the block the
+# previous pass left, up to column order.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_final_logits_are_the_last_pass():
+    dtype = torch.bfloat16
+    head = _head(device="cuda", dtype=dtype)
+    assert head.topc >= V
+    head.fold_from_raw_(torch.randn(R, B, B, dtype=dtype, device="cuda") * 0.3)
+    head.build_fused_buffers()
+    torch.manual_seed(17)
+    n, passes = 2, 4
+    base = torch.randn(n, B, V, dtype=dtype, device="cuda")
+    h = torch.randn(n, B, H, dtype=dtype, device="cuda")
+    anchor = torch.randint(0, V, (n,), device="cuda")
+    tok_am1 = torch.randint(0, V, (n,), device="cuda")
+
+    plain, none = head.jacobi_refine_greedy(base, h, anchor, tok_am1, passes)
+    draft, final = head.jacobi_refine_greedy(
+        base, h, anchor, tok_am1, passes, return_final_logits=True
+    )
+    assert none is None
+    assert torch.equal(draft, plain), "returning the logits changed the draft"
+    assert final is not None and final.shape == (n * (B - 1), V)
+
+    # Slot b reads the token in slot b - 1; slot 0 reads the anchor's predecessor.
+    prev_draft, _ = head.jacobi_refine_greedy(base, h, anchor, tok_am1, passes - 1)
+    prev_ids = torch.cat([tok_am1[:, None], anchor[:, None], prev_draft[:, :-1]], 1)
+    expected = base[:, 1:] + head.refine_bias(prev_ids, head.hidden_cache(h))[:, 1:]
+    expected = expected.reshape(n * (B - 1), V).float()
+
+    torch.testing.assert_close(
+        final.float().sort(dim=-1).values,
+        expected.sort(dim=-1).values,
+        atol=5e-2,
+        rtol=2e-2,
+    )
 
 
 def _head(

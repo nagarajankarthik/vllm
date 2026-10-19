@@ -37,11 +37,20 @@ class XPressSpeculator(DFlashSpeculator):
         self.num_query_per_req = 1 + self.num_speculative_steps
 
         self.num_jacobi_passes = int(getattr(hf, "xpress_num_passes", 6))
+        topc = getattr(hf, "xpress_topc", 512)
         logger.info(
             "XPress: %d Jacobi passes, top-C=%s",
             self.num_jacobi_passes,
-            getattr(hf, "xpress_topc", 512) or "off",
+            topc or "off",
         )
+        # The acceptance estimator scores the logits the last pass took its argmax
+        # over. Only the top-C path has them in hand; the full-vocab path never
+        # materializes its [rows, V] sum.
+        if self.enable_adaptive_verification and not topc:
+            raise ValueError(
+                "Adaptive verification for XPress requires top-C scoring; set "
+                "xpress_topc > 0 or disable enable_adaptive_verification."
+            )
         # Query offset 0 of each request is the anchor. Its refined output is
         # discarded; its latent reaches the draft slots through mixer column 0.
         self._anchor_idx = (
@@ -90,7 +99,20 @@ class XPressSpeculator(DFlashSpeculator):
         # speculator can reach, so the anchor id stands in for it (see __init__).
         tok_am1 = anchor_ids
         head = self.model.model.xpress_head
-        draft = head.jacobi_refine_greedy(
-            base_full, h_full, anchor_ids, tok_am1, self.num_jacobi_passes
+        draft, final_logits = head.jacobi_refine_greedy(
+            base_full,
+            h_full,
+            anchor_ids,
+            tok_am1,
+            self.num_jacobi_passes,
+            return_final_logits=self.acceptance_estimator is not None,
         )
         self.draft_tokens[:num_reqs, : self.num_speculative_steps] = draft
+        if final_logits is not None:
+            # Rows are request-major over draft slots 1..N, the sample_* layout.
+            num_sample = num_reqs * self.num_speculative_steps
+            self._maybe_predict_acceptance(
+                final_logits,
+                self.sample_idx_mapping[:num_sample],
+                self.sample_col[:num_sample],
+            )
