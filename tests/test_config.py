@@ -43,7 +43,7 @@ from vllm.config.compilation import CompilationMode, CUDAGraphMode, PassConfig
 from vllm.config.kernel import IrOpPriorityConfig
 from vllm.config.load import LoadConfig
 from vllm.config.mamba import MambaBackendEnum
-from vllm.config.speculative import _validate_qwen3_omni_dspark
+from vllm.config.speculative import XPRESS_ARCHITECTURES, _validate_qwen3_omni_dspark
 from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
 from vllm.platforms import current_platform
@@ -3588,10 +3588,10 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
-@pytest.mark.parametrize("draft_sample_method", ["greedy", "probabilistic"])
-def test_xpress_requires_greedy_drafting(tmp_path: Path, draft_sample_method: str):
-    """XPress never fills the cached draft logits, so probabilistic rejection
-    would grade its drafts against an empty proposal distribution."""
+def _xpress_speculative_config(
+    tmp_path: Path, architecture: str, draft_sample_method: str = "greedy"
+) -> SpeculativeConfig:
+    """A tiny local Llama target and XPress draft, so nothing is downloaded."""
     from transformers import LlamaConfig
 
     common = dict(
@@ -3613,7 +3613,7 @@ def test_xpress_requires_greedy_drafting(tmp_path: Path, draft_sample_method: st
         draft_path / "config.json",
         dict(
             common,
-            architectures=["Qwen3XPressModel"],
+            architectures=[architecture],
             model_type="qwen3",
             num_hidden_layers=1,
             dflash_config=dict(
@@ -3626,22 +3626,41 @@ def test_xpress_requires_greedy_drafting(tmp_path: Path, draft_sample_method: st
     model_config = ModelConfig(
         model=str(target_path), tokenizer_mode="skip", max_model_len=2048
     )
+    return SpeculativeConfig(
+        method="dflash",
+        model=str(draft_path),
+        num_speculative_tokens=3,
+        draft_sample_method=draft_sample_method,
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(),
+    )
 
-    def make() -> SpeculativeConfig:
-        return SpeculativeConfig(
-            method="dflash",
-            model=str(draft_path),
-            num_speculative_tokens=3,
-            draft_sample_method=draft_sample_method,
-            target_model_config=model_config,
-            target_parallel_config=ParallelConfig(),
-        )
 
+@pytest.mark.parametrize("draft_sample_method", ["greedy", "probabilistic"])
+def test_xpress_requires_greedy_drafting(tmp_path: Path, draft_sample_method: str):
+    """XPress never fills the cached draft logits, so probabilistic rejection
+    would grade its drafts against an empty proposal distribution."""
     if draft_sample_method == "greedy":
-        assert make().is_xpress()
+        assert _xpress_speculative_config(
+            tmp_path, "Qwen3XPressModel", draft_sample_method
+        ).is_xpress()
     else:
         with pytest.raises(ValueError, match="XPress drafts greedily"):
-            make()
+            _xpress_speculative_config(
+                tmp_path, "Qwen3XPressModel", draft_sample_method
+            )
+
+
+# AutoModel exports under its training class name; EAGLEConfig then rewrites it to
+# DFlash{arch}, so both spellings must reach the XPress speculator.
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen3XPressModel", "Qwen3XPressDraftModel", "DFlashQwen3XPressDraftModel"],
+)
+def test_xpress_architecture_spellings_are_detected(tmp_path: Path, architecture: str):
+    config = _xpress_speculative_config(tmp_path, architecture)
+    assert config.is_xpress()
+    assert set(config.draft_model_config.architectures) <= XPRESS_ARCHITECTURES
 
 
 def _watermarked_vllm_config() -> VllmConfig:

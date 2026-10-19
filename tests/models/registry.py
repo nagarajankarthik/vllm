@@ -1529,6 +1529,21 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         use_original_num_layers=True,  # The refiner reads aux hidden states
         max_num_seqs=16,  # XPress sizes a [max_num_seqs * block, vocab] scratch
     ),
+    # AutoModel's export spelling; no public checkpoint carries it yet.
+    "Qwen3XPressDraftModel": _HfExamplesInfo(
+        "Qwen/Qwen3-8B",
+        speculative_model="UIUC-SSAIL/Qwen3-8B-XPress-b16",
+        use_original_num_layers=True,
+        max_num_seqs=16,
+        is_available_online=False,
+    ),
+    "DFlashQwen3XPressDraftModel": _HfExamplesInfo(
+        "Qwen/Qwen3-8B",
+        speculative_model="UIUC-SSAIL/Qwen3-8B-XPress-b16",
+        use_original_num_layers=True,
+        max_num_seqs=16,
+        is_available_online=False,
+    ),
     # [DSpark]
     "DSparkDraftModel": _HfExamplesInfo(
         "deepseek-ai/DeepSeek-V4-Pro-DSpark",

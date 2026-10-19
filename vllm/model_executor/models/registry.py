@@ -656,6 +656,9 @@ _SPECULATIVE_DECODING_MODELS = {
     # for. The bare name is kept as a defensive alias, as for MuseGlimmer.
     "Qwen3XPressModel": ("qwen3_xpress", "Qwen3XPressForCausalLM"),
     "DFlashQwen3XPressModel": ("qwen3_xpress", "Qwen3XPressForCausalLM"),
+    # AutoModel exports XPress drafts under their training class name.
+    "Qwen3XPressDraftModel": ("qwen3_xpress", "Qwen3XPressForCausalLM"),
+    "DFlashQwen3XPressDraftModel": ("qwen3_xpress", "Qwen3XPressForCausalLM"),
     "K3DSparkModel": (
         "vllm.models.kimi_k3.nvidia.dspark_mla",
         "K3DSparkForCausalLM",
