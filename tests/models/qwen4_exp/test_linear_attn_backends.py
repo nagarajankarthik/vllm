@@ -29,12 +29,13 @@ DEVICE = torch.device("cpu")
 NUM_SPEC = 3
 
 
-def test_only_the_qwen4_exp_backends_accept_device_query_lens() -> None:
+def test_qwen4_exp_backends_accept_device_query_lens() -> None:
     for backend in (Qwen4ExpGDNAttentionBackend, Qwen4ExpPleShortConvAttentionBackend):
         assert backend.supports_device_cpu_query_lens_mismatch()
-    # The shared bases keep the SSM opt-out for every other model.
-    for backend in (GDNAttentionBackend, PleShortConvAttentionBackend):
-        assert not backend.supports_device_cpu_query_lens_mismatch()
+    # The shared GDN base accepts them too; the shared PLE base keeps the SSM
+    # opt-out for every other model.
+    assert GDNAttentionBackend.supports_device_cpu_query_lens_mismatch()
+    assert not PleShortConvAttentionBackend.supports_device_cpu_query_lens_mismatch()
     assert (
         Qwen4ExpGDNAttentionBackend.get_builder_cls()
         is Qwen4ExpGDNAttentionMetadataBuilder

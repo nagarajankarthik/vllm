@@ -7,7 +7,6 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.qwen3_xpress import xpress_num_jacobi_passes
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -37,21 +36,12 @@ class XPressSpeculator(DFlashSpeculator):
         self.sample_from_anchor = False
         self.num_query_per_req = 1 + self.num_speculative_steps
 
-        self.num_jacobi_passes = xpress_num_jacobi_passes(hf)
-        topc = getattr(hf, "xpress_topc", 512)
+        self.num_jacobi_passes = int(getattr(hf, "xpress_num_passes", 6))
         logger.info(
             "XPress: %d Jacobi passes, top-C=%s",
             self.num_jacobi_passes,
-            topc or "off",
+            getattr(hf, "xpress_topc", 512) or "off",
         )
-        # The acceptance estimator scores the logits the last pass took its argmax
-        # over. Only the top-C path has them in hand; the full-vocab path never
-        # materializes its [rows, V] sum.
-        if self.enable_adaptive_verification and not topc:
-            raise ValueError(
-                "Adaptive verification for XPress requires top-C scoring; set "
-                "xpress_topc > 0 or disable enable_adaptive_verification."
-            )
         # Query offset 0 of each request is the anchor. Its refined output is
         # discarded; its latent reaches the draft slots through mixer column 0.
         self._anchor_idx = (
@@ -100,20 +90,20 @@ class XPressSpeculator(DFlashSpeculator):
         # speculator can reach, so the anchor id stands in for it (see __init__).
         tok_am1 = anchor_ids
         head = self.model.model.xpress_head
-        draft, final_logits = head.jacobi_refine_greedy(
+        draft, logits = head.jacobi_refine_greedy(
             base_full,
             h_full,
             anchor_ids,
             tok_am1,
             self.num_jacobi_passes,
-            return_final_logits=self.acceptance_estimator is not None,
+            return_logits=self.acceptance_estimator is not None,
         )
         self.draft_tokens[:num_reqs, : self.num_speculative_steps] = draft
-        if final_logits is not None:
-            # Rows are request-major over draft slots 1..N, the sample_* layout.
+        if logits is not None:
+            # Rows are ordered (req, draft slot), like the sampling rows.
             num_sample = num_reqs * self.num_speculative_steps
             self._maybe_predict_acceptance(
-                final_logits,
+                logits,
                 self.sample_idx_mapping[:num_sample],
                 self.sample_col[:num_sample],
             )
