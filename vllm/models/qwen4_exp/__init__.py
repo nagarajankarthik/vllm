@@ -12,6 +12,7 @@ from .common.hyperconnection import (
 )
 
 if TYPE_CHECKING:
+    from .nvidia.eagle3 import Qwen4ExpEagle3ForCausalLM
     from .nvidia.model import (
         Qwen4ExpForCausalLM,
         Qwen4ExpForConditionalGeneration,
@@ -20,6 +21,14 @@ if TYPE_CHECKING:
 
 
 def __getattr__(name: str) -> Any:
+    if name == "Qwen4ExpEagle3ForCausalLM":
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda():
+            raise NotImplementedError("Qwen4Exp EAGLE-3 is NVIDIA-only")
+        from .nvidia.eagle3 import Qwen4ExpEagle3ForCausalLM
+
+        return Qwen4ExpEagle3ForCausalLM
     if name in {
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
@@ -55,6 +64,7 @@ __all__ = [
     "GroupedGemmaRMSNorm",
     "HyperConnectionBase",
     "HyperConnectionConfig",
+    "Qwen4ExpEagle3ForCausalLM",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
     "Qwen4ExpMTP",

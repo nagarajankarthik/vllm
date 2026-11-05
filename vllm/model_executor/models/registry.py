@@ -749,6 +749,14 @@ _SPECULATIVE_DECODING_MODELS = {
     "Qwen3NextMTP": ("qwen3_next_mtp", "Qwen3NextMTP"),
     "Step5MTP": ("vllm.models.step5", "Step5MTP"),
     "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
+    "QwenSparseEagle3DraftModel": (
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpEagle3ForCausalLM",
+    ),
+    "Eagle3QwenSparseEagle3DraftModel": (
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpEagle3ForCausalLM",
+    ),
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("vllm.models.qwen3_5", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("vllm.models.qwen3_5", "Qwen3_5MoeMTP"),

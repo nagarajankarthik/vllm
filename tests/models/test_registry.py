@@ -65,6 +65,12 @@ def test_registry_imports(model_arch):
         pytest.skip("HY V4 is only supported on CUDA and ROCm")
 
     if (
+        model_arch in ("QwenSparseEagle3DraftModel", "Eagle3QwenSparseEagle3DraftModel")
+        and not current_platform.is_cuda()
+    ):
+        pytest.skip("Qwen4Exp EAGLE-3 is only supported on CUDA")
+
+    if (
         model_arch == "DeepseekV4ForConditionalGeneration"
         and not current_platform.is_cuda_alike()
     ):
@@ -132,6 +138,7 @@ def test_registry_is_pp(model_arch, is_pp):
         ("Qwen4ExpForCausalLM", True),
         ("Qwen4ExpForConditionalGeneration", True),
         ("Qwen4ExpMTP", True),
+        ("Eagle3QwenSparseEagle3DraftModel", True),
         ("LlamaForCausalLM", False),
     ],
 )

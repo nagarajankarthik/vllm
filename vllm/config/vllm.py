@@ -96,6 +96,8 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "DeepseekV41ForCausalLM",
         "Dots3NoteForCausalLM",
         "Dots3NoteMTPModel",
+        # Qwen4Exp QSA EAGLE-3 draft, before and after EAGLEConfig wrapping.
+        "Eagle3QwenSparseEagle3DraftModel",
         "Glm5NextForCausalLM",
         "Glm5NextForConditionalGeneration",
         "Glm5NextMTPModel",
@@ -114,6 +116,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "Qwen4ExpMTP",
+        "QwenSparseEagle3DraftModel",
         "Step5ForCausalLM",
         "Step5ForConditionalGeneration",
     }

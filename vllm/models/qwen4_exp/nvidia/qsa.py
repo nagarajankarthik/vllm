@@ -308,6 +308,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        input_size: int | None = None,
     ) -> None:
         nn.Module.__init__(self)
         cache_config = vllm_config.cache_config
@@ -340,6 +341,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
         self.config = config
         self.hidden_size = int(config.hidden_size)
+        # Width of the Q/K/V and indexer projection input. EAGLE-3 drafters
+        # feed [embeds | hidden] (2 * hidden_size); o_proj still emits
+        # hidden_size.
+        self.input_size = int(input_size or self.hidden_size)
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = int(config.num_attention_heads)
         if self.total_num_heads % tp_size:
@@ -371,7 +376,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.attn_output_gate = True
 
         self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
+            self.input_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
@@ -447,6 +452,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             rotary_emb=self.rotary_emb,
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
+            input_size=self.input_size,
         )
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of

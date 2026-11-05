@@ -79,6 +79,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Step5Config": "vllm.transformers_utils.configs.step5",
     "Step5VLConfig": "vllm.transformers_utils.configs.step5",
     "Qwen3ASRConfig": "vllm.transformers_utils.configs.qwen3_asr",
+    "QwenSparseEagle3DraftConfig": (
+        "vllm.transformers_utils.configs.qwen_sparse_eagle3"
+    ),
     "FlintConfig": "vllm.models.flint.configs",
     "InklingModelConfig": "vllm.models.inkling.configs",
     "InklingAudioConfig": "vllm.models.inkling.configs",
@@ -153,6 +156,7 @@ __all__ = [
     "Step5Config",
     "Step5VLConfig",
     "Qwen3ASRConfig",
+    "QwenSparseEagle3DraftConfig",
     "FlintConfig",
     "InklingModelConfig",
     "InklingAudioConfig",

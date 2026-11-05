@@ -126,6 +126,97 @@ def _rope_only_sizes_cache(hf_config: PreTrainedConfig) -> bool:
     )
 
 
+_QWEN_SPARSE_EAGLE3_ARCHITECTURE = "QwenSparseEagle3DraftModel"
+# Target-model keys a draft config derived from the Qwen4Exp target config
+# carries but the single-layer drafter must not see: hc_mult would widen the
+# speculator's hidden-state buffers, layer_types/PLE describe the target stack.
+# quantization_config is kept so that the drafter rejects quantized drafts.
+_QWEN_SPARSE_EAGLE3_DROPPED_KEYS = (
+    "layer_types",
+    "n_predict",
+    "num_nextn_predict_layers",
+    "index_share_for_mtp_iteration",
+)
+_QWEN_SPARSE_EAGLE3_DROPPED_PREFIXES = ("hc_", "ple_", "mtp_")
+
+
+def _normalize_qwen_sparse_eagle3_draft(
+    hf_config: PreTrainedConfig,
+) -> PreTrainedConfig:
+    """Normalize an Automodel ``QwenSparseEagle3DraftModel`` config for serving.
+
+    The draft is a single QSA + MoE decoder layer fed by EAGLE-3 aux hidden
+    states. Its positions are 1D, so the target's interleaved MRoPE layout,
+    which training copies but which reduces to 1D RoPE, is dropped.
+    """
+    rope_parameters = getattr(hf_config, "rope_parameters", None)
+    if rope_parameters is not None:
+        rope_parameters = dict(rope_parameters)
+        rope_parameters.pop("mrope_section", None)
+        rope_parameters.pop("mrope_interleaved", None)
+        hf_config.rope_parameters = rope_parameters
+    for key in list(vars(hf_config)):
+        if key in _QWEN_SPARSE_EAGLE3_DROPPED_KEYS or key.startswith(
+            _QWEN_SPARSE_EAGLE3_DROPPED_PREFIXES
+        ):
+            delattr(hf_config, key)
+
+    defaults = {
+        "hidden_act": "silu",
+        "norm_topk_prob": True,
+        "attention_bias": False,
+        "num_aux_hidden_states": 3,
+        "fc_norm": False,
+        "norm_output": False,
+    }
+    for key, value in defaults.items():
+        if getattr(hf_config, key, None) is None:
+            setattr(hf_config, key, value)
+    if getattr(hf_config, "target_hidden_size", None) is None:
+        hf_config.target_hidden_size = hf_config.hidden_size
+    if getattr(hf_config, "draft_vocab_size", None) is None:
+        hf_config.draft_vocab_size = hf_config.vocab_size
+
+    layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+    if not layer_ids:
+        # Automodel records the training ids as ``aux_layer_ids``, where id i
+        # is the output of decoder layer i. vLLM captures that state as id
+        # i + 1 (the state after i layers).
+        trained_ids = getattr(hf_config, "aux_layer_ids", None)
+        if not trained_ids:
+            raise ValueError(
+                "QwenSparseEagle3DraftModel needs eagle_aux_hidden_state_layer_ids "
+                "(or Automodel's aux_layer_ids) in the draft config.json."
+            )
+        layer_ids = [int(layer_id) + 1 for layer_id in trained_ids]
+        logger.info(
+            "Using EAGLE-3 aux layers %s derived from the draft's aux_layer_ids %s.",
+            layer_ids,
+            list(trained_ids),
+        )
+    layer_ids = list(layer_ids)
+    if not all(isinstance(layer_id, int) for layer_id in layer_ids):
+        raise ValueError(
+            "eagle_aux_hidden_state_layer_ids must contain only integers; "
+            f"got {layer_ids}."
+        )
+    if len(layer_ids) != hf_config.num_aux_hidden_states:
+        raise ValueError(
+            f"eagle_aux_hidden_state_layer_ids has {len(layer_ids)} entries but "
+            f"num_aux_hidden_states is {hf_config.num_aux_hidden_states}."
+        )
+    # The target emits aux states in layer order, while fc's input chunks
+    # follow the configured order, so the two only agree for ascending ids.
+    if any(a >= b for a, b in zip(layer_ids, layer_ids[1:])):
+        raise ValueError(
+            "eagle_aux_hidden_state_layer_ids must be strictly ascending (the "
+            f"order of fc's input chunks); got {layer_ids}."
+        )
+    hf_config.eagle_aux_hidden_state_layer_ids = layer_ids
+    hf_config.num_hidden_layers = 1
+    return hf_config
+
+
 _MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl", "minimax_m3_text")
 _MINIMAX_M3_DSPARK_SUBFOLDER = "dspark"
 
@@ -782,6 +873,10 @@ class SpeculativeConfig:
             # Qwen3 DSpark drafts reuse the DeepSeek-V4 DSpark architecture name.
             hf_config.update({"architectures": ["Qwen3DSparkModel"]})
             return hf_config
+        if initial_architecture == _QWEN_SPARSE_EAGLE3_ARCHITECTURE:
+            # Must run before the qwen4_exp rewrite below, which would turn a
+            # target-derived draft config into the native MTP drafter.
+            return _normalize_qwen_sparse_eagle3_draft(hf_config)
         if initial_architecture == "Gemma4DSparkModel":
             # Normalize the Gemma4 DSpark draft's config keys to DSpark's.
             if (

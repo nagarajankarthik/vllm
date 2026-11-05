@@ -104,6 +104,7 @@ class QSAIndexer(nn.Module):
         rotary_emb: nn.Module,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        input_size: int | None = None,
     ) -> None:
         super().__init__()
         if vllm_config.cache_config is None:
@@ -130,7 +131,7 @@ class QSAIndexer(nn.Module):
         self.skip_topk = False
 
         self.index_qk_proj = ReplicatedLinear(
-            int(config.hidden_size),
+            int(input_size or config.hidden_size),
             (self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
             bias=False,
             quant_config=quant_config,
