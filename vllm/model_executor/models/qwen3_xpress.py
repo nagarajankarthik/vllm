@@ -313,17 +313,13 @@ class Qwen3XPressModel(DFlashQwen3Model):
             )
         if taps:
             self.decoder_layer_cls = DFlash2Qwen3DecoderLayer
-        # AutoModel applies these to the draft's embeddings and logits; this
-        # runtime does not, so a draft that sets them would be served wrongly.
-        for key in ("input_embedding_scale", "output_multiplier"):
-            if float(draft_config.get(key, 1.0)) != 1.0:
-                raise NotImplementedError(f"XPress does not support {key} != 1.")
-        if float(draft_config.get("final_logit_softcapping") or 0.0) > 0.0:
-            raise NotImplementedError(
-                "XPress does not support final_logit_softcapping."
-            )
         super().__init__(
             vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
+        )
+        # Targets such as Gemma scale their input embeddings, which the shared
+        # embedding table does not include; AutoModel applies the same scale.
+        self.input_embedding_scale = float(
+            draft_config.get("input_embedding_scale", 1.0)
         )
         config = self.config
         draft_vocab_size = (
@@ -347,6 +343,9 @@ class Qwen3XPressModel(DFlashQwen3Model):
                 self.xpress_head.refine_bias, dynamic=False
             )
             logger.info("XPress head refine_bias wrapped with torch.compile")
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().embed_input_ids(input_ids) * self.input_embedding_scale
 
 
 class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
@@ -378,6 +377,11 @@ class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        draft_config = getattr(self.config, "dflash_config", None) or {}
+        self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
+        self.final_logit_softcapping = float(
+            draft_config.get("final_logit_softcapping") or 0.0
+        )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             raise NotImplementedError(
@@ -390,7 +394,16 @@ class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, hidden_states)
+        # AutoModel's order: multiplier, then softcap. The refiner bias is added
+        # to these base logits, so LogitsProcessor (softcap, then scale) is not
+        # used for them.
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self.output_multiplier != 1.0:
+            logits = logits * self.output_multiplier
+        if self.final_logit_softcapping > 0.0:
+            cap = self.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+        return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = {}
