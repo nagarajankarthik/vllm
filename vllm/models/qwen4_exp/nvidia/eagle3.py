@@ -54,11 +54,6 @@ def _validate(config, vllm_config: VllmConfig) -> None:
     """
     if not current_platform.is_cuda():
         raise NotImplementedError("Qwen4Exp EAGLE-3 is NVIDIA-only")
-    if not vllm_config.use_v2_model_runner:
-        raise NotImplementedError(
-            "Qwen4Exp EAGLE-3 requires the V2 model runner: V1's EAGLE proposer "
-            "does not support the QSA indexer caches"
-        )
     if getattr(config, "parallel_drafting", False):
         raise NotImplementedError("Qwen4Exp EAGLE-3 does not support P-EAGLE")
     if config.attention_bias:

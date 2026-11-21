@@ -59,9 +59,10 @@ def test_qwen4_exp_backends_accept_device_query_lens() -> None:
 def test_varlen_cudagraph_bound_is_one_verification_request(builder_cls) -> None:
     vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
-            num_speculative_tokens=NUM_SPEC, parallel_drafting=False
+            num_speculative_tokens=NUM_SPEC,
+            parallel_drafting=False,
+            max_num_new_slots_for_drafting=0,
         ),
-        use_v2_model_runner=True,
     )
     bound = builder_cls.get_varlen_cudagraph_max_query_len(vllm_config, None)
     assert bound == NUM_SPEC + 1
@@ -71,6 +72,7 @@ def _gdn_builder(full_cuda_graph: bool = False) -> Qwen4ExpGDNAttentionMetadataB
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B", block_size=BLOCK_SIZE
     )
+    vllm_config.cache_config.enable_prefix_caching = False
     vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
@@ -131,6 +133,7 @@ def test_ple_draftless_decode_next_to_verification() -> None:
         method="ngram", num_speculative_tokens=NUM_SPEC
     )
     config.speculative_config.enable_adaptive_verification = True
+    config.cache_config.enable_prefix_caching = False
     config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
     config.compilation_config.max_cudagraph_capture_size = 32
     builder = Qwen4ExpPleShortConvAttentionMetadataBuilder(

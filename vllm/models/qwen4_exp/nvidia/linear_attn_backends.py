@@ -39,11 +39,7 @@ class Qwen4ExpGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # The base enables block-table reuse for its exact type only, to keep
         # out subclasses with per-group metadata; this one adds none.
-        if (
-            not self.supports_update_block_table
-            and vllm_config.use_v2_model_runner
-            and device.type == "cuda"
-        ):
+        if not self.supports_update_block_table and device.type == "cuda":
             self.supports_update_block_table = True
             self.mamba_aligned_state_indices = None
 

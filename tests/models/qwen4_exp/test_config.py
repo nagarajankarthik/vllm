@@ -121,10 +121,13 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams(
     def decoder(**kwargs):
         """Check that the embedding residual shares the hidden state's token slice."""
         hidden = kwargs["hidden_states"]
+        outputs = (hidden, hidden, torch.zeros(hidden.shape[0], model.hc_count))
         if backend == "nvidia":
             prev_block_output = kwargs["prev_block_output"]
             assert prev_block_output.shape == (hidden.shape[0], model.hidden_size)
-        return hidden, hidden, torch.zeros(hidden.shape[0], model.hc_count)
+            # The NVIDIA layer also returns its attention-side block input.
+            return (*outputs, hidden)
+        return outputs
 
     model.layers = [decoder]
     model.hyper_connection_mixer = SimpleNamespace(
