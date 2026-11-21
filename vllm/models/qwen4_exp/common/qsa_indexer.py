@@ -6,7 +6,7 @@ Each QSA layer keeps a fixed circular buffer of raw index keys (the
 compressor state) and one compressed key. MRoPE models pack exact three-axis
 positions beside the raw keys; text models derive group positions from
 logical positions. The compressor state uses one block per request, while
-    the compressed owner uses ``MLAAttentionSpec.tokens_per_state`` so its block
+    the compressed owner uses `MLAAttentionSpec.tokens_per_state` so its block
 table follows the main KV-cache lifecycle. Their physical tensor storage is
 shared by the generic cache-layout planner.
 """
@@ -38,19 +38,24 @@ from vllm.v1.attention.backends.utils import (
     PAD_SLOT_ID,
     split_decodes_and_prefills,
 )
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
+    FullAttentionManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    CircularBufferSpec,
+    KVCacheLayerConfig,
     KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
+    SparseCacheRole,
 )
 
 logger = init_logger(__name__)
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
-    """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
+    """Return exact per-token positions as `[tokens, 1, 3]` int64 rows."""
     if positions.ndim == 1:
         positions = positions.unsqueeze(0).expand(3, -1)
     elif positions.ndim != 2 or positions.shape[0] not in (1, 3):
@@ -170,7 +175,7 @@ def compressed_qsa_slot_mapping(
     compress_ratio: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build boundary-only slots for an ``MLAAttentionSpec`` QSA cache."""
+    """Build boundary-only slots for an `MLAAttentionSpec` QSA cache."""
     if storage_block_size <= 0 or compress_ratio <= 0:
         raise ValueError("QSA block size and compression ratio must be positive")
     compressed_positions = torch.div(
@@ -643,7 +648,8 @@ class QSAIndexerMetadataBuilder(AttentionMetadataBuilder[QSAIndexerMetadata]):
         self.varlen_decode = (
             spec_config is not None and spec_config.enable_adaptive_verification
         )
-        self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
+        # The raw-key ring is the only QSA cache with an uncompressed spec.
+        self.is_circular_buffer = not isinstance(kv_cache_spec, MLAAttentionSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = kv_cache_spec.tokens_per_state
             assert isinstance(compress_ratio, int), (
@@ -933,33 +939,36 @@ class QSARawKeyCache(_QSAIndexerCache):
             return None
         return self.kv_cache[..., self.rope_position_offset :].view(torch.int64)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
         capacity = qsa_ring_capacity(
             self.compress_ratio,
             vllm_config.num_speculative_tokens,
             self.cache_config.block_size,
         )
-        return CircularBufferSpec(
+        spec = AttentionSpec(
             block_size=capacity,
             num_kv_heads=1,
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
         )
+        return CircularBufferManager.layer_config(spec)
 
 
 class QSACompressedKeyCache(_QSAIndexerCache):
     """Normed, group-first-RoPE key at one row per complete group."""
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
         del vllm_config
-        return MLAAttentionSpec(
+        spec = MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,
             tokens_per_state=self.compress_ratio,
+            cache_role=SparseCacheRole.INDEXER,
         )
+        return FullAttentionManager.layer_config(spec)
 
 
 __all__ = [
@@ -976,7 +985,7 @@ __all__ = [
 
 
 def qsa_kv_cache_dtype(cache_config: CacheConfig, prefix: str) -> CacheDType | str:
-    """The layer's KV cache dtype, honoring ``--kv-cache-dtype-skip-layers``."""
+    """The layer's KV cache dtype, honoring `--kv-cache-dtype-skip-layers`."""
     from vllm.model_executor.models.utils import extract_layer_index
 
     if str(extract_layer_index(prefix)) in cache_config.kv_cache_dtype_skip_layers:
