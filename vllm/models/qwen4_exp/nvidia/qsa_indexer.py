@@ -235,6 +235,7 @@ class QSAIndexer(nn.Module):
         qkv: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
         main_kv_cache: torch.Tensor | None = None,
+        block_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Update indexer caches and select token indices from pre-projected Q/K.
 
@@ -249,6 +250,11 @@ class QSAIndexer(nn.Module):
         its Q and gate from `qkv`, returned as the second element (None
         otherwise). `qkv`, `slot_mapping` and `main_kv_cache` are only
         read in that mode.
+
+        `block_indices` [num_tokens, token_topk // compress_ratio] receives
+        the selected compressed blocks before expansion: each row's leading
+        min(top-k, visible) entries, then -1. Not written on `skip_topk`
+        steps.
         """
         metadata = self._metadata()
         if metadata is None:
@@ -414,13 +420,6 @@ class QSAIndexer(nn.Module):
         num_decode_tokens = compressed_metadata.num_decode_tokens
         decode_query_len = compressed_metadata.decode_query_len
         visible_blocks = compressed_metadata.visible_blocks[:num_tokens]
-        block_indices = torch.empty(
-            num_tokens,
-            self.token_topk // self.compress_ratio,
-            dtype=torch.int32,
-            device=q.device,
-        )
-
         # Decode requests occupy the leading rows. They share one query length,
         # unless varlen_decode, where decode_query_len only bounds the lengths
         # and the device offsets hold the true ones.
